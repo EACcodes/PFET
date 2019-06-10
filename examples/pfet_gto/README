@@ -1,0 +1,44 @@
+Before running the PFET calculations, you need to print out the grid 
+and the AO basis on the grid. Grid can be obtained in the Molpro output
+file. Molpro uses the quadrature grid and more information can be found
+at https://www.molpro.net/info/2012.1/doc/manual/node184.html
+It may also be helpful to check the cube command in Molpro manual at
+https://www.molpro.net/info/2012.1/doc/manual/node503.html
+
+The cube.F was originally coded up to plot properties such as density and
+potential on a user-defined uniform grid. Here I modified the code so 
+that it will use the DFT quadrature grid and ignore the defined uniform 
+grid. For molecular systems, quadrature grids (in which the grid points 
+are more densed near the nuclei) are faster and more accurate compared to
+the uniform grid.
+ 
+
+AO basis on the grid can be printed via modifying the code 
+/scratch/gpfs/qou/Molpro_test/Molpro/scr/prop/cube.F:
+1.Uncomment lines 1105, 1110, 1116
+2.Issue: cd .. | make
+3.Go back to working directory and run molpro sys1-1.com >ao_basis
+
+To get the grid file:
+1.Copy sys1-1.out to file3.txt
+2.Locate the lines that correspond to the grid and cut off the rest;
+  file3.txt should have the format # x y z where x y z is the coordinate
+  of a grid point. 
+
+
+cube.F is the main code that controls the inv_KS process in Molpro. After
+you get the ao basis and the grid, go back to cube.F and comment lines 1105,
+1110, and 1116, then uncomment line 1113 (so that it will print out the 
+densities) and remake the executable. 
+
+You also need to issue
+vemb_ini.py 
+in order to set up the initial embedding matrix. The variable
+"a" in this script need to be adjusted as the # of basis functions.
+
+test-ao.py controls the PFET calculation. The submission script is job.s
+
+###TODO###
+Right now, one still needs to get into Molpro's code in order to run PFET.
+It would be great to set up some flags to let the cube.F know what to do.
+Same thing needs to be done for python scripts. 

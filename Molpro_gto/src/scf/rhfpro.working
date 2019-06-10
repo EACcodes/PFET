@@ -1,0 +1,1351 @@
+c-----------------------------------------------------------------------
+      subroutine rhfpro
+c-----------------------------------------------------------------------
+      use diis
+      use tf_dfexch
+      implicit double precision (a-h,o-z)
+      logical dispol,save,fitonly,fitenergy,do_exchange,lblock,symort
+      logical print_wallcl
+c.....equivalence (dc(1),qwb(1))
+      character*3 method
+      character*4 orth
+      character*32 code
+      include "common/cdirect"
+      logical first,opensh,startocc,lprint_head
+      logical fitcoul,fitexch
+      logical direct_save
+      integer data,basis,sm,ho,ho1,tegr,ekin,dip,dik,rs,wf,ew,dm,pol
+      include "common/openmp"
+      include "common/maxbfn"
+      include "common/maxatm"
+      include "common/etig"
+      include "common/cref"
+      include "common/tapes"
+      include "common/molen"
+      include "common/cdft"
+      include "common/cppscf"
+      include "common/cprint"
+#include "common/dumpinfor.fh"
+      include "common/bas"
+      include "common/cmpp"
+      include "common/scfopt"
+      include "common/big"
+      include "common/chirs"
+      include "common/cosmo"
+      include "common/caoint"
+      include "common/thresh"
+      include "common/cstat"
+      include "common/sparder"
+      include "common/second"
+      common/cgrdx/ igrdc,iclscf(0:3),iclmc
+      common/ganz/ nkern,ngf,ngg,ngt(8),ntro
+      include "common/zahl"
+      include "common/celec"
+      include "common/zmpi"
+      include "common/zmpd"
+      character*3 scftyp,type*6,diagt*20
+      character*32 tempf
+      common/code/data,basis,sm,ho,ho1,tegr(10),ekin,dip(3),dik,rs,wf(2)
+     1,ew(2),dm(2),pol,naf,norba,konfi,mel,lige,maen,madi,maspi,inwe,ked
+     1,mhf,kwf,neof
+      common/ccore/ncore,icore(10),nitco(2,10)
+      common/cstrt/ nwf,nfil,startden,ifsav
+      common/corbi/ noc,nocc(8),ncl,iclos(8),nsym,noc1,nvn1,mult(8,8),
+     1              iclos_save(8),ncr
+      character*4 ipdis,kcore,ken*16
+      dimension prof(7),dipol(3),scfoccs(8)
+      dimension nbsa(8),nbsb(8),orig(3),nocc_save(8)
+      logical :: coarse_grid,coarse_dfit,changed_thresholds,coarse
+C BEGIN PHIL
+      logical :: isjgrid,allocj
+      type(diis_state_t) :: diis_state
+C END PHIL
+c BEGIN andreas
+      common /clhf/ resp_damp,ilhfdm,maxit_resp,thr_resp
+c END andreas
+      data ipdis/'DIIS' /
+      data kcore/'CORE'/
+c BEGIN ZMP
+      integer izmp, iterzmp, izmpfpos
+      logical lzmp
+c BEGIN EDFT
+      integer iedft, iemb
+      logical, external :: get_logical
+      real*8 mygc(100000),mygcvec(100000),myfc(ntqg),myfcvec(ntdg)
+      lzmp=.false.
+      iterzmp=0
+      izmp=iget_scalar('!ZMP')
+      if(izmp.ne.0) lzmp=.true.
+c END ZMP
+      iedft=iget_scalar('!EDFT')
+c END EDFT
+      ibase = icorr(0)
+      if(iprint(39).ge.0) then
+        call add_mpptim('TOTAL',0,0)
+        call add_mpptim('INIT',0,0)
+      end if
+      nen1=number_of_records(1)
+      nen4=number_of_records(4)
+      lprint_head=.true.
+      istatx(1)=-1
+      notcon=0
+      diagt='start'
+      iter=0
+      nita=1
+      nitx=0
+      notkon=0
+      shipa=0.0d0
+      shipb=0.0d0
+      jgrid=0
+      isjgrid=.false.
+      code=' '
+      call get_inpi('CFIT','CFIT',icfit)
+      if(idft.ne.0) then
+        call get_inpi('JGRID','CFIT',jgrid)
+        if(icfit.ge.1.and.jgrid.gt.0) then
+        isjgrid=.true.
+        call get_inps('CODE','KSOPT',code)
+        if(code.eq.' '.or.code(1:3).eq.'DEF') then
+          code='CBLAS'
+          call set_inps('CODE',0,code,'KSOPT')
+        end if
+        end if
+      end if
+      ! ^- (cgk) is this jgrid stuff really required all over the place? can't there
+      !          be some extra initialization/termination functions?
+      nhf=0
+      ishsq_done=0
+      if(.not.lzmp) call anfa(0)
+      call get_inpl('COARSE','HFOPT',coarse)
+      if(.not.coarse) thrdscf_max=thrdscf
+      coarse_grid=.false.
+      allocj=.false.
+      maxit_fine=0
+      if(idft.ne.0) then
+        call get_inpl('COARSEGRID','KSOPT',coarse_grid)
+        if(coarse_grid) then
+          call get_inpf('COARSENESS','KSOPT',coarsefac)
+          call get_inpi('MAXIT_FINE','KSOPT',maxit_fine)
+          coarse_grid=coarsefac.gt.1.d0
+        else
+          call dftgrid_finegrid
+          coarse_grid=.false.
+        end if
+      end if
+      call clearvar('!DFHFENERG')
+c
+      if(icosmo.ne.0) call cosmo_initialize
+      ediel=0.d0
+      nen1=number_of_records(1)
+      cpu_start=second()
+      iprescr=abs(iprescr)
+      iprescr_save=iprescr
+      thrdscf_min=thrdscf
+      thrdscf=thrdscf_max
+      nxitort=nitort
+      orth=' '
+      call get_inpl('SYMORT','HFOPT',symort)
+      if(symort) write(iout,'(1x,a/)')
+     >  'Using symmetrical orthogonalization'
+      scftyp='RHF'
+      if(idft.ne.0) then
+        scftyp='RKS'
+        if(startden.eq.0d0) startden=-1.d0  !default for dft: start with density matrix
+      end if
+      if(startden.eq.-2.d0) startden=0.d0 !do not start with density matrix
+      scf_exch=0d0
+      save=.false.
+      call chklun(npl(ifsav),iflag,tempf)
+      if(iflag.lt.0.and.ifsav.ne.1) then
+        call chklun(npl(1),iflag,tempf)
+        save=iflag.gt.0
+      end if
+      ndim=1
+      ndel=0
+      bfak=1.0d0
+      call upcase(iptyp)
+      dispol=iptyp.eq.'DIIS'.or.iptyp.eq.'KAIN'.or.iptyp.eq.'BASE'
+      if(.not.dispol.and.iptyp.ne.'NONE')
+     >   call error("iptyp not recognized","RHF")
+      diis_state %ndim = 0
+      if(iptyp.eq.'KAIN'.or.iptyp.eq.'DIIS')
+     >  call CreateDiisState(diis_state,max(0,maxdis-1),
+     >       idiis_fileno(),2901,1d6)
+      do i=1,ntg
+        nb(i)=iabs(nb(i))
+      end do
+      ncore=0
+   96 call input(ncol)
+      call gets(1,ken,1)
+      if(ken(1:4).ne.kcore) then
+        call backspace_inp
+        goto 95
+      else
+        call getf(2,prof,5)
+      end if
+      do 94 k=1,5,2
+      i=int(prof(k))
+      if(i.eq.0) goto 94
+      j=int((prof(k)-dble(i))*10d0+0.1d0)
+      ncore=ncore+1
+      icore(ncore)=i+nts(j)
+      nitco(1,ncore)=int(prof(k+1))
+      nitco(2,ncore)=int((prof(k+1)-dble(nitco(1,ncore)))*10d0+0.1d0)
+   94 continue
+      goto 96
+   95 iepos=icorr(ntg)
+      numf = 3                    ! three fock matrices: RHF fock, Fock/A, Fock/B.
+      call get_inpi('ALGO','HFOPT', iTwoStepRohf)
+      if(iTwoStepRohf==0) numf=1  ! only ROHF fock matrix.
+      ifpos=icorr(numf * ntdg)
+      icpos=icorr(ntqg)
+      nclll=ncl
+      noccc=noc
+      nvnnn=nvn
+      nsymm=nsym
+      nit_occ=1
+      call imove(nocc,nocc_save,8)
+      call imove(iclos,iclos_save,8)
+      emin=0d0
+      nit=0
+      method='RHF'
+      ixcmat=icorr(ntqg)
+      if(idft.ne.0) method='RKS'
+      call set_dac_diag(1)
+      call scfini(q(ifpos),q(icpos),q(iepos),q(icpos),q(iepos),
+     >     istart,method,nset,icfit,fitcoul,fitexch,coarse_dfit)
+      call set_dac_diag(1)
+      ibase0 = icorr(0)
+c... istart=-1:  start with H0
+c... istart=0:   start with atomic density guess
+c... istart=1:   start with previous orbitals, same basis
+c... istart=2:   start with previous orbitals, different basis
+c... istart=3:   special case for maxit=1, sets final parameters
+      if(istart.lt.0) ipnit=max0(ipnit,3)
+      call get_inpf('THRCOARSE','THRESH',thrcoarse)
+      if(thrcoarse.le.0d0) then
+        thrcoarse=1.d-4
+        if(icfit.ne.0) thrcoarse=max(5.d-5,sqrt(abfr)*5.d0)
+        if(idft.ne.0) thrcoarse=1.d-3
+      end if
+      if(direct) thren=max(thren,thrdscf_min*1.d4)
+      fitonly=fitexch.or.(fitcoul.and.idft.ne.0.and.exfac.eq.0d0)
+      if(icfit.eq.1.and..not.fitonly) then
+        thrdscf_min=min(1.d-9,thrdscf_min*10d0) !coarser threshold if only exchange needed
+        if(.not.coarse) thrdscf=thrdscf_min
+      end if
+      if(fitonly) then
+        call get_inpf('THRAO_SCF','CFIT',thrscf)
+        if(thrscf.ge.0d0) then
+          thrdscf_min=thrscf
+          thrdscf=thrscf
+        end if
+      end if
+      nen1=max(nen1,number_of_records(1))
+      iclosed=1
+      if(nel.ne.nel1) iclosed=0
+      opensh=iclosed.eq.0.or.isyref.gt.1
+!       if(opensh) itend=max(itend,3)
+      if(istart.gt.0) then
+        if(dump_iset.eq.0.or.dump_iset.gt.dump_nset) then
+          write(6,*) ' PROBLEM WITH DUMP_ISET.',
+     >               ' PLEASE CONTACT MOLPRO SUPPORT'
+          call fehler
+        end if
+        nita=3
+        itend=itend+2
+        shipa=0d0
+        shipb=0d0
+        ipnit=max0(ipnit,4)
+        if(icpp.ne.0) icpp=3
+        if(nsymm.lt.0) then
+           nsymm=max(1,isyref)
+           nsym=nsymm
+        end if
+        if(dump_nelec(dump_iset).ne.nelec.or.
+     >     dump_ms2(dump_iset).ne.ms2.or.
+     >     (istart.eq.1.and.dump_sym(dump_iset).ne.isyref)) then
+c... in these cases the state changed. Start ordering and shifting only later.
+           if(nitord.lt.0) nitord=6
+           if(nitsh.lt.0) nitsh=6
+           if(nitocc.lt.0) nitocc=8
+        end if
+        if(dump_basflg.eq.0.or.istart.ge.2) then
+          thrdscf=thrdscf_min
+c         if(idft.ne.0.and.coarse_grid) then
+c           call dftgrid_finegrid
+c           coarse_grid=.false.
+c         end if
+          if(dump_basflg.eq.0) istart=1
+        else
+          thrdscf=min(thrdscf_max,thrdscf_min*10.d0)
+        end if
+      end if
+      call corlsr(ibase0)
+c
+      do_exchange=iclosed.ne.0.and.iexchange.ne.0.and.icfit.eq.0
+      if(.not.opensh) numf=1  ! only closed-shell fock matrix.
+      ifpos=icorr(numf*ntdg)
+      igpos=icorr(ntdg)  ! used for open shell exchange and (temporarily) for orbital gradient
+!       if(opensh.or.idft.ne.0.or.do_exchange) igpos=icorr(ntdg)
+      if(IsRangeHybrid.eq.1) then
+        ibidon=icorr(ntdg)
+        ifc_c = icorr(ntdg)
+        ifo_c = icorr(ntdg)
+      end if
+      idapos=icorr(ntdg)
+      idbpos=idapos
+      if(opensh.or.idft.ne.0) idbpos=icorr(ntdg)
+      if(icfit.gt.4) call dfexch_init(nt(1),nel,ms2)
+      if(isjgrid.and..not.allocj) then
+        call fzero(q(idapos),ntdg)
+        call fzero(q(ifpos),ntdg)
+c... this call only to precompute the 3-index integrals. Must be done
+c... before base memory point is set. HJW
+        if(iclosed.ne.1) call error("Poisson on grid (JGRID) not"//
+     >      " implemented for open shell",'rhfpro line~623')
+        if(nsk.ne.1) call error("nosym must be used with"//
+     >      " poisson on grid (JGRID)",'rhfpro line~623')
+        maxt=1
+!$      maxt=omp_get_max_threads()
+        if(jgrid.gt.0) write(iout,'(/1x,3a,i1,a,i2)') 'Using ',
+     >       trim(code),' code, jgrid=',jgrid,
+     >     ', number of openmp threads=',maxt
+        call alloc_jint
+        allocj=.true.
+      end if
+c... All memory passed to hfma must be allocated before this point
+      if(iedft.ne.0.and..not.lzmp) iemb=icorr(ntdg)
+      if(lzmp) izmpfpos=icorr(ntdg)
+      ispos=icorr(ntqg)
+      itpos=icorr(ntqg)
+      iupos=icorr(ntqg)
+      call les(q(ispos),ntdg,1,sm)
+      call expan(q(ispos),q(ispos),1,1,1)
+      call les(q(itpos),ntdg,1,rs)           !S^{-1/2
+      call expan(q(itpos),q(itpos),1,1,1)
+      call mulq(q(ispos),q(itpos),q(iupos))  !S^{1/2} on iupos
+c... iscr1 is base memory in iteration.
+      iscr1=icorr(ntqg)
+      call read_orb(q(icpos),1)
+      call rotate(q(icpos))
+      call write_orb(q(icpos),1,'CANONICAL')
+      nit=nita
+      if(minrot.eq.0) then
+        if(istart.gt.0) then
+          minrot=4
+        else if(istart.eq.0) then
+          minrot=3
+          if(opensh.or.idft.gt.0) minrot=4
+        else
+          minrot=5
+        end if
+      else if(minrot.lt.0) then
+        minrot=itend+5
+      else
+        if(opensh.or.idft.gt.0) minrot=max(minrot,3)
+      end if
+      minrot=max(minrot,nita+1)
+      first=.true.
+      cpu_last=second()
+      if(nitord.lt.0) then
+        nitord=8
+        if(nita.gt.1.and.ms2.ne.0) nitord=3
+      end if
+      if(nitocc.lt.0) then
+        if(istart.le.0) then
+          nitocc=8
+        else
+          nitocc=1  !in case of restart, use old occupation
+          if(nitsh.lt.0) nitsh=3
+        end if
+      end if
+      nitsh=max(nitsh,0)
+      call izero(nbsb,8)
+      call reserv(ntdg,4,pol,-1)
+      ndiis=0
+      grad=0d0
+      ddiff=0d0
+      eold=0d0
+      ioccwarn=0
+      ! ^- set to 2 once an occupation warning is emitted. Used to control
+      !    the ``use ... to suppress deviation warnings'' output.
+      itmax=itend
+      if(iprint(39).ge.0) call add_mpptim('INIT',0,1)
+      nits=nit
+c     write(6,*) 'nitord=',nitord,'  nitsh=',nitsh,'  nitcl=',nitcl,
+c    >           '  nitocc=',nitocc
+      call scfocc(q(iepos),0)
+      isyref=nsym  ! <- nsym made by scfocc.
+!       call rhf_search_occupations_and_adjust_orbs(nocc,iclos,
+!      >   q(icpos),q(iepos), noc,ncl,mult)
+      call reset_nb_from_iocc(nbs,nbs1,nb, nocc,iclos)
+
+      print_wallcl=.false.
+      wall_dfti_tot=0d0
+      if(code.eq.'CBLAS'.and.iprint(39).ge.0) then
+        print_wallcl=.true.
+        wstart=wallcl()
+        wlast=wstart
+      end if
+      itmax=max(itmax,itend)
+c... read spin-dependent embedding potential
+       if(iedft.ne.0.and..not.lzmp) then
+        ifil=2
+        irec=iedft
+        call les(q(iemb),ntdg,ifil,irec)
+       end if
+c... END embed
+      goto 10
+c
+c...
+c...  ITERATIONS START HERE (apart from first).
+c...
+c...  At this point we have the closed/open Fock matrices (ifpos+igpos),
+c...  density matrices (idapos/idbpos) and orbitals (icpos) from the from
+c...  the last iteration.
+c
+   1  call resdel(q(ifpos))
+      iscr2=icorr(ntqg)
+      iscr3=icorr(ntqg+2*ntg)
+      if (numf/=1) then
+        ifposa = ifpos + ntdg
+        ifposb = ifpos + 2 * ntdg
+      else
+        ifposa = ifpos
+        ifposb = ifpos
+      end if
+      if(nit.ge.nitsh) then
+        shipa=shopa
+        shipb=shopb
+      end if
+c...  set scr1 := S * C (for MO->AO transform of fock matrices)
+      call mulq(q(ispos), q(icpos), q(iscr1))
+
+      call make_rohf_fock_ao(q(ifposa),q(ifposb),q(ifpos),q(igpos),
+     >   q(icpos),q(iscr1),q(iscr2),q(iscr3),shipa,shipb,numf,opensh)
+
+c...  overwrite igpos (previously: open-shell exchange) with orbital
+c...  gradient in smh basis. Also calc gradient norm.
+c...  note: one of the gradient variants depends on S*C being passed
+c...        in q(iscr1).
+      call make_rohf_orb_grad(q(igpos),grdnr,grdmx,q(ifpos),
+     >   q(icpos),q(itpos),q(iupos),q(iscr1),q(iscr2),q(iscr3),
+     >   opensh,q(idapos),ndim,iptyp=='KAIN')
+      if (igpos == ifpos)
+     >   call error("g and f must be distinct!!","ROHF")
+
+  5   nits=nit+1
+c...  test convergence. sets notkon ("not converged").
+      call konvor(grdnr,grdmx,q(idapos),q(iscr3),notkon,pol)
+      nit=nit+1
+      ndiis=0
+      if(dispol.and.(nit.ge.ipnit.and.nit.lt.itend)) then
+c...  extrapolate Fock matrix in iterative subspace
+        if(iprint(39).ge.0) call add_mpptim('DIIS',0,0)
+        ipnit=ipnit+ipstep ! if ipstep/=1, this skips the next interpolation(s)
+        if(iptyp=='BASE')then
+          ! DIIS, default implementation
+          call corlsr(iscr1)      ! temporarily free some memory
+          call diiss_core(q(ifpos),numf,q(igpos),ndim,ndel,bfak,1)
+          ndiis=ndim-1
+        else if(iptyp=='KAIN')then
+          ! Krylov subspace accelerated inexact newton.
+          ! note: this only works reliably when the first branch is
+          ! taken in make_rohf_orb_grad
+          ! transform density matrix into orthogonalized AO basis.
+          call tranop_mpp(q(idapos),q(iupos),q(iscr3),1,1,1,0)
+          call corlsr(iscr1)      ! temporarily free some memory
+          diis_state %iDiisMode = 1
+          call ApplyDiisCore(diis_state, q(idapos), ntdg, q(igpos),
+     >      ntdg, q(ifpos), numf*ntdg)
+          ndiis=diis_state%nDimUsed
+        else if(iptyp=='DIIS')then
+          ! DIIS, alternative implementation
+          call corlsr(iscr1)      ! temporarily free some memory
+          call ApplyDiisCore(diis_state, q(ifpos), ntdg, q(igpos),
+     >      ntdg, q(ifpos+ntdg), (numf-1)*ntdg)
+          ndiis=diis_state%nDimUsed
+        else
+          call error("iptyp not recognized.","RHF")
+        end if
+        iscr1=icorr(ntqg)
+        iscr2=icorr(ntqg)
+        iscr3=icorr(ntqg+2*ntg)
+        if(iprint(39).ge.0) call add_mpptim('DIIS',0,1)
+        gradmx=grad ! extrapolated gradient norm from DIIS.
+      end if
+c...  make new orbitals
+      call rhf_update_orbitals_1(orth,diagt, ifpos,icpos,iepos,ispos,
+     >   iscr1,iscr2,iscr3, nb,nit, opensh,numf,
+     >   shipa,shipb,ioccwarn)
+      isyref=nsym
+      call reset_nb_from_iocc(nbs,nbs1,nb, nocc,iclos)
+10    nsp=1
+      nvn=nvnnn
+      if(iprint(39).ge.0) call add_mpptim('DIMA',0,0)
+      if(iedft.ne.0.and.lzmp.and.first) then
+       if(eiter.ne.0) then
+       call fmove(q(izmpcpos),q(icpos),ntqg)
+       write(6,*) 'orbitals in'
+       do i=1, 5
+         write(6,*) q(icpos+i-1)
+        end do
+        end if
+       end if
+      call write_orb(q(icpos),1,'CANONICAL')
+      call write_eig(q(iepos),1,'CANONICAL')
+c...  calculate and store new density charge/spin density matrices.
+      call update_densities(idapos,idbpos,icpos,iscr1,
+     >   nocc,iclos,opensh)
+      if(iprint(39).ge.0) call add_mpptim('DIMA',0,1)
+      ns=0
+20    call flush_dump
+      if(.not.opensh.and.idft.ne.0) then
+        call fzero(q(idbpos),ntdg)
+        call fzero(q(igpos),ntdg)
+      end if
+! ^- cgk: ?
+
+cstart olddmscf
+c;c...   dmscf jump out here
+c;      zz=0d0
+c;      call getvar('DMSCF',zz,tempf,ity,nv,1,1)
+c;      if (zz.gt.0d0) then
+c;       call corlsr(iepos)
+c;       call dmscf
+c;       call corlsr(ibase)
+c;       call unset_dac_diag(1)
+c;       return
+c;      end if
+cend
+      if(lprint_head) then
+      if(.not.direct) write(iout,990)
+  990 format(/1x,'ITERATION    DDIFF',10x,
+     1    'GRAD',13x,'ENERGY',8x,'2-EL.EN.',12x,'DIPOLE MOMENTS',
+     1    9x,'DIIS',3x,'ORB.')
+      if(fitonly) write(iout,991)
+  991 format(/1x,'ITERATION   DDIFF',12x,
+     1    'GRAD',12x,'ENERGY',8x,'2-EL.EN.',12x,'DIPOLE MOMENTS',
+     1    9x,'DIIS',3x,'CPU(IT)  CPU(TOT)  ORB.')
+      lprint_head=.false.
+      end if
+
+      changed_thresholds=.false.
+      if(nitx.ge.2
+     &   .and.ddiff.gt.0.d0
+     &    .and.((direct.and.thrdscf.gt.1.1d0*thrdscf_min)
+     &   .or.(idft.ne.0.and.coarse_grid.and.maxit_fine.gt.0)
+     &   .or.coarse_dfit)) then
+        if(iter.ge.11-nita.or.nit.eq.itend
+     &    .or.ddiff.lt.thrcoarse) then
+c...reduce threshold to final value
+          thrdscf=thrdscf_min
+          nit=nits
+          if(nit.eq.itend) itend=nit+2
+          nitx=0
+c...restart diis
+          ndel=0
+          ndim=1
+          if(diis_state %ndim.ne.0) call ResetDiisState(diis_state)
+          if (thrdscf.ne.0d0 .and. idft.ne.0.and.maxit_fine.gt.0) then
+           write(iout,9930) thrdscf
+ 9930      format(' Reducing integral threshold to ',1pd9.2,
+     >            ', restarting DIIS and selecting fine grid')
+          else if (thrdscf.ne.0d0) then
+           write(iout,9932) thrdscf
+ 9932      format(' Reducing integral threshold to ',1pd9.2,
+     >            ' and restarting DIIS')
+          else if(idft.ne.0.and.maxit_fine.gt.0) then
+           write(iout,9931)
+ 9931      format(' Selecting fine grid and restarting DIIS')
+          end if
+c... re-orthogonalization
+          if(nitort.ne.0) then
+            call fmove(q(ispos),q(iscr1),ntqg)
+            call orths(q(icpos),q(iscr1),q(iscr2),q(iscr3))
+            orth='orth'
+            nxitort=nit+nitort
+          end if
+c... density fitting parameters for final iteration
+          iprescr=-1
+          if(icfit.ge.1) call df_defparms(1)
+          if(coarse_grid.and.maxit_fine.gt.0) then
+            call dftgrid_finegrid
+            coarse_grid=.false.
+          end if
+          coarse_dfit=.false.
+          changed_thresholds=.true.
+        end if
+      end if
+      if(nit.eq.itend.and.coarse_grid) then
+        call dftgrid_finegrid
+        coarse_grid=.false.
+      end if
+      call corlsr(iscr1)
+      epoisson=0d0
+c... density fitting parameters for final energy
+      fitenergy=.false.
+      if(icfit.ge.1.and.nit.eq.itend) then
+        call get_inpi('CFIT_FINAL','CFIT',icfit_final)
+        if(icfit_final.lt.0) icfit_final=icfit
+        icfit_final=min(icfit_final,icfit)
+        if(fitexch.and.icfit_final.le.1.and..not.first) call free_gpt
+        if(icfit_final.eq.0) then
+          write(iout,*) 'No density fitting for final energy'
+          fitcoul=.false.
+          fitexch=.false.
+          if(icfit.gt.1) first=.true.
+          iprescr=-1
+          icfit=0
+        else if(icfit_final.eq.1) then
+          if(icfit.gt.1) write(iout,*)
+     >       'No exchange fitting for final energy'
+          fitexch=.false.
+          if(icfit.gt.1) then
+            first=.true.
+            iprescr=-1
+          end if
+          icfit=1
+        else if(icfit_final.ge.2) then
+          call df_defparms(2)
+          icfit=icfit_final
+          call get_inpi('FITENERG','CFIT',ifit_energy)
+          call get_inpi('LOCFIT','CFIT',locfit)
+          if(locfit.lt.0) call get_inpi('LOCFIT_SCF','CFIT',locfit)
+          fitenergy=(ifit_energy.gt.0.and.locfit.gt.0)
+     >              .or.ifit_energy.gt.1
+        end if
+        iprescr=-1
+        call set_inpi('CFIT_SCF',12,icfit,'CFIT')
+        prnt_dfock=.false.
+      end if
+      if(iprint(39).ge.0) call add_mpptim('HFMA',0,0)
+
+      if(IsRangeHybrid.eq.1) then
+        IsChi_save=IsChi
+        IsChi=0
+        direct_save=direct
+        direct=.true.
+        exfac_save=exfac
+        exfac=0d0
+        call hfma(q(idapos),q(idbpos),q(ifpos),q(ibidon),iclosed,
+     >            idft,0,first,.true.,q(icpos),fitcoul,fitexch)
+        IsChi=IsChi_save
+        direct=direct_save
+        exfac=exfac_save
+        if(iclosed.eq.0) then
+          call hfma(q(idapos),q(idbpos),q(ifc_c),q(igpos),iclosed,
+     >              idft,0,.false.,.true.,q(icpos),fitcoul,fitexch)
+          call addvec(q(ifpos),q(ifpos),q(ifc_c),ntdg)
+          exfac=0d0
+          call hfma(q(idapos),q(idbpos),q(ifc_c),q(ifo_c),iclosed,
+     >              idft,0,.false.,.true.,q(icpos),fitcoul,fitexch)
+          call subvec(q(ifpos),q(ifpos),q(ifc_c),ntdg)
+          exfac=exfac_save
+        else
+          if(direct) then
+            call hfma(q(idapos),q(idbpos),q(igpos),q(ifc_c),iclosed,
+     >                idft,0,first,.true.,q(icpos),fitcoul,fitexch)
+            exfac=0d0
+            call hfma(q(idapos),q(idbpos),q(ifc_c),q(ifo_c),iclosed,
+     >                idft,0,.false.,.true.,q(icpos),fitcoul,fitexch)
+            exfac=exfac_save
+            call subvec(q(igpos),q(igpos),q(ifc_c),ntdg)
+          else
+            call hfma(q(idapos),q(idbpos),q(ifc_c),q(igpos),iclosed,
+     >                idft,0,.false.,.true.,q(icpos),fitcoul,fitexch)
+          endif
+        endif
+CAOM .. C...  Compute long-range coulomb + exchange fock matrix
+CAOM .. C...  q(ifpos) contains long-range coulomb and q(igpos) long-range exchange
+CAOM .. c...  Note: all memory passed to hfma must be allocated before iscr1 in header!
+CAOM ..         call hfma(q(idapos),q(idbpos),q(ifpos),q(igpos),iclosed,
+CAOM ..      >         idft,0,first,.true.,q(icpos),fitcoul,fitexch)
+CAOM .. CTLD
+CAOM ..         call fzero(q(ifc_c),ntdg)
+CAOM ..         call fzero(q(ifo_c),ntdg)
+CAOM ..         exfac_save=exfac
+CAOM ..         exfac=0
+CAOM ..         call hfma(q(idapos),q(idbpos),q(ifc_c),q(ifo_c),iclosed,
+CAOM ..      >            idft,0,first,.true.,q(icpos),fitcoul,fitexch)
+CAOM ..         exfac=exfac_save
+CAOM ..         call subvec(q(ifc_c),q(ifpos),q(ifc_c),ntdg)
+CAOM .. CTLF
+CAOM ..
+CAOM .. C...  File and record to get the non-modified two-electron integrals
+CAOM .. c       ifile_aoint = 1
+CAOM .. c       irec_aoint  = 1300
+CAOM ..         IsChi_save=IsChi
+CAOM ..         IsChi=0
+CAOM ..         direct_save=direct
+CAOM ..         direct=.true.
+CAOM ..         exfac_save=exfac
+CAOM ..         exfac=0
+CAOM ..         call hfma(q(idapos),q(idbpos),q(ifpos),q(ibidon),iclosed,
+CAOM ..      >         idft,0,first,.false.,q(icpos),fitcoul,fitexch)
+CAOM ..         IsChi=IsChi_save
+CAOM ..         direct=direct_save
+CAOM ..         exfac=exfac_save
+CAOM ..         call addvec(q(ifpos),q(ifpos),q(ifc_c),ntdg)
+CAOM .. c
+CAOM .. C...  File and record to get the modified long-range two-electron integrals
+CAOM .. c       ifile_aoint = 1
+CAOM .. c       irec_aoint  = NewRec+10
+      else
+C...  Construction of Fock matrix in the default case
+c...  Note: all memory passed to hfma must be allocated before iscr1 in header!
+
+C BEGIN PHIL
+       if(isjgrid) then
+        if(iexchg.eq.0) then
+         call fzero(q(igpos),ntdg)
+         call fzero(q(ifpos),ntdg)
+        else
+         call hfma(q(idapos),q(idbpos),q(ifpos),q(igpos),iclosed,
+     >        idft,0,first,.true.,q(icpos),fitcoul,fitexch)
+        endif
+       else
+        call hfma(q(idapos),q(idbpos),q(ifpos),q(igpos),iclosed,
+     >       1,0,first,.true.,q(icpos),fitcoul,fitexch)
+        ifock=icorr(ntdg)
+        do i=1,ntdg
+           q(ifock+i-1)=q(ifpos+i-1)
+        enddo
+        if (idft.eq.0) then
+            mygc=0d0
+            mygcvec=0d0
+            myfc=0d0
+            myfcvec=0d0
+            myvec=0
+            mysqr=0
+            call readm(myfc,ntqg,1,7400,0,str)
+            do mysym=1,nsk
+               myn=nt(mysym)
+               call redu(myfc(1+mysqr),myfcvec(myvec+1),myn)
+               myvec=myvec+myn*(myn+1)/2
+               mysqr=mysqr+myn*myn
+            enddo
+            do i=1,ntdg
+               q(ifpos-1+i)=q(ifpos-1+i)+myfcvec(i)
+               q(igpos-1+i)=0.0
+            enddo
+         endif
+       endif
+C END PHIL
+      endif
+cmgs
+c     set DFTEXFAC for proper use in dft-sapt (hf-sapt) calculations
+      call setvar('DFTEXFAC',exfac,'AU',1,1,nv,0)
+cmgs
+      if(iprint(39).ge.0) call add_mpptim('HFMA',0,1)
+c...  Here memory is reallocated since hfma might allocate some memory which must be permanent
+      iscr1=icorr(ntqg)
+      ihpos=icorr(ntdg)
+      call les(q(ihpos),ntdg,1,ho1)
+c      call outvec(q(ihpos),ntdg,"H0")
+c     call read_orb(q(icpos),1)
+      iprescr=iprescr_save
+      do i=1,3
+        call read_op(q(iscr1),dipnuc,'DM',i,1,1,orig,isyop)
+        dipol(i)=-spur(q(idapos),q(iscr1))+dipnuc
+      end do
+      vcpp0=0d0
+      if (icpp.ne.0.and.nit.ge.icpp) then
+        if(iprint(39).ge.0) call add_mpptim('CPP',0,0)
+        iflag=0
+        if(iclosed.eq.0) iflag=1
+        call scfcpp(q(icpos),q(idapos),q(idbpos),q(ifpos),q(igpos),
+     >              q(ispos),q(iscr1),vcpp0,dipol,iflag)
+        if(iprint(39).ge.0) call add_mpptim('CPP',0,1)
+      end if
+      dftval(0)=0d0
+      scf_exch=0d0
+      if(idft.eq.0) then
+        zwen=spur(q(idapos),q(ifpos))
+        if(opensh) zwen=zwen+spur(q(idbpos),q(igpos))
+      else
+
+C BEGIN PHIL - moved dfti here to calc. coulomb contribution prior to 2e- energy
+c
+c     A special case for jgrid=1 was set up - if jgrid=0 the original code is executed.
+c
+       if(jgrid.ge.1) then
+C     Temporary exchange triangle to hold exact exchange
+        igtemp=icorr(ntdg)
+        iab=1
+        do i=1,ntg
+         do j=1,i
+          q(igtemp+iab-1)=q(igpos+iab-1)
+          iab=iab+1
+         enddo
+        enddo
+
+        if(iexchg.ne.0) then
+         if(iclosed.ne.0) then
+          if(ilexchg.eq.1) then !LHF local exact exchange ->
+           if(ilhfdm.eq.0) then
+              call lhf_iter(q(icpos),q(idapos),q(iepos),q(ifpos),
+     >             q(igpos),scf_exch,fitexch)
+           else
+              call lhf_iter_den(q(idapos),q(ifpos),
+     >             q(igpos),scf_exch,fitexch,maxit_resp,thr_resp,iter)
+           endif
+           zwen=spur(q(idapos),q(ifpos))+scf_exch*exfac
+          elseif(ilexchg.eq.3) then !ELP local exact exchange ->
+           scf_exch=spur(q(idapos),q(igpos))
+           call elp(q(icpos),q(idapos),q(iepos),q(ifpos),q(igpos),
+     >              1d0,iter)
+           zwen=spur(q(idapos),q(ifpos))+scf_exch*exfac
+          else
+           scf_exch=spur(q(idapos),q(igpos))
+          endif
+          call daxpy_X(ntdg,exfac,q(igpos),1,q(ifpos),1)
+         else
+c...  we cannot compute scf exchange in open-shell case
+          call dscal_X(ntdg,exfac,q(igpos),1)
+         end if
+        elseif(ilexchg.eq.2) then !TLHF case
+         ivxpos=icorr(ntdg)
+         call tlhf_get_info(exxen,q(ivxpos))
+         zwen=spur(q(idapos),q(ifpos))+spur(q(idbpos),q(igpos))+
+     >        exxen*exxfac
+         call daxpy_X(ntdg,exxfac,q(ivxpos),1,q(ifpos),1)
+         call corlsr(ivxpos)
+        end if
+
+        if(print_wallcl) w1=wallcl()
+        call dfti(q(idapos),q(idbpos),q(ifpos),q(igpos),iclosed,jgrid)
+        if(print_wallcl) wall_dfti=wallcl()-w1
+
+        if(ilexchg.eq.0) then
+         zwen=coulen(0)!+spur(q(idbpos),q(igtemp)) ! I have no idea of the relevance of the second part of this
+        endif
+c        call set_inpi('JGRID',5,0,'CFIT')
+c This is the non-jgrid case
+       else
+
+        if(iexchg.ne.0) then
+          if(iclosed.ne.0) then
+            if(ilexchg.eq.1) then !LHF local exact exchange ->
+              if(ilhfdm.eq.0) then
+                call lhf_iter(q(icpos),q(idapos),q(iepos),q(ifpos),
+     >               q(igpos),scf_exch,fitexch)
+              else
+                 call lhf_iter_den(q(idapos),q(ifpos),q(igpos),scf_exch,
+     >                fitexch,maxit_resp,thr_resp,iter)
+              endif
+              zwen=spur(q(idapos),q(ifpos))+scf_exch*exfac
+            elseif(ilexchg.eq.3) then !ELP local exchange ->
+              scf_exch=spur(q(idapos),q(igpos))
+              call elp(q(icpos),q(idapos),q(iepos),q(ifpos),q(igpos),
+     >                 1d0,iter)
+              zwen=spur(q(idapos),q(ifpos))+scf_exch*exfac
+            else
+               scf_exch=spur(q(idapos),q(igpos))
+            endif
+            call daxpy_X(ntdg,exfac,q(igpos),1,q(ifpos),1)
+          else
+c... we cannot compute scf exchange in open-shell case
+            call dscal_X(ntdg,exfac,q(igpos),1)
+          end if
+        elseif(ilexchg.eq.2) then !TLHF case
+          ivxpos=icorr(ntdg)
+          call tlhf_get_info(exxen,q(ivxpos))
+          zwen=spur(q(idapos),q(ifpos))+spur(q(idbpos),q(igpos))+
+     >         exxen*exxfac
+          call daxpy_X(ntdg,exxfac,q(ivxpos),1,q(ifpos),1)
+          call corlsr(ivxpos)
+        end if
+c
+        if(ilexchg.eq.0) then
+           zwen=spur(q(idapos),q(ifpos))+spur(q(idbpos),q(igpos))
+        endif
+c
+        ! make orbital occupation numbers; then run DFTI integration.
+        call make_rhf_occ(ioccc,iocco, iclos,nocc, ntg,nts,nsk)
+        call dfti_occ(q(idapos),q(idbpos),q(ifpos),q(igpos),iclosed,
+     >   q(icpos),q(ioccc),q(icpos),q(iocco),0,ntg,0)
+        ixcvec=icorr(ntdg)
+        do i=1,ntdg
+           q(ixcvec-1+i)=q(ifpos-1+i)-q(ifock-1+i)
+        enddo 
+        myvec=0
+        mysqr=0
+        do mysym=1,nsk
+           myn=nt(mysym)
+           call square(q(ixcmat+mysqr),q(ixcvec+myvec),myn,myn)
+           myvec=myvec+myn*(myn+1)/2
+           mysqr=mysqr+myn*myn
+        enddo
+       end if
+C END PHIL
+      endif
+ 600   if (icpp.ne.0.and.nit.ge.icpp) then
+        call addvec(q(ihpos),q(iscr1),q(ihpos),ntdg)
+      end if
+      
+      gesen=spur(q(idapos),q(ihpos))+zwen*z05+ekern+dftval(0)+vcpp0
+     >  +epoisson
+      s=z1
+!       if(potfac.eq.z0.or.potfac.eq.z1) then
+!         if(nit.eq.1.and.istart.lt.0) s=0.66d0
+!         if(nit.eq.2.and.istart.lt.0) s=0.9d0
+!       end if
+      do i=1,ntdg
+        q(ifpos-1+i)=q(ifpos-1+i)*s+q(ihpos-1+i)
+      end do
+      if(opensh.and.s.ne.z1) then
+        do i=1,ntdg
+          q(igpos-1+i)=q(igpos-1+i)*s
+        end do
+      end if
+c... cosmo
+      if(icosmo.ne.0) then
+         if(iprint(39).ge.0) call add_mpptim('COSMO',0,0)
+         itcosmo=iget_scalar('COSMOIT')
+         if(itcosmo.le.0) then
+            call cosmo_evaluate(q(idapos),q(ifpos),ediel,.false.)
+         else
+            call cosmo_evaluate(q(idapos),q(ifpos),ediel,.true.)
+         endif
+         gesen=gesen+ediel
+         call setvar ('COSMOES',gesen,' ',1,1,nv,0)
+         if(iprint(39).ge.0) call add_mpptim('COSMO',0,1)
+      endif
+c... NOTE:
+c    ifpos in now the updated fock matrix, containing the
+c    sum_i qi*<a|1/ri|b> elements.
+c    ->problems, if used for 2e elements!!
+c
+      iter=iter+1
+      if(icosmo.ne.0.and.iprint_cosmo.ge.0)
+     >  write(iout,'(1x,a,t36,f19.8)') 'Dielectric energy:',ediel
+      if(orth.ne.' ') diagt=orth
+      if(.not.direct) then
+        write(iout,992) iter,ddiff,grad,gesen,zwen,(dipol(i),i=1,3),
+     >                  ndiis,trim(diagt)
+      else
+        cpu=second()
+        cpu_it=cpu-cpu_last
+        cpu_tot=cpu-cpu_start
+        cpu_last=cpu
+        write(iout,9921) iter,ddiff,grad,gesen,zwen,(dipol(i),i=1,3),
+     >                  ndiis,cpu_it,cpu_tot,trim(diagt)
+      end if
+
+ 992  format(1x,i4,2d15.3,f19.8,f14.6,1x,3(f10.5,1x),i4,4x,a)
+ 9921 format(1x,i4,2d15.3,f19.8,f14.6,1x,3(f10.5,1x),i4,:,2f9.1,5x,a)
+
+      nitx=nitx+1
+      if(gesen.lt.emin) then
+c... save best occupations
+        call imove(nocc,nocc_save,8)
+        if(igrdc.le.1) call imove(iclos,iclos_save,8)
+        emin=gesen
+      end if
+      de=abs(gesen-eold)
+      eold=gesen
+      thren=max(thren,1.d-15*abs(gesen)) !avoid no convergence due to numerical scatter
+      if(nit.eq.nita+1.and.notkon.eq.0) then
+        if(de.gt.thren.or.s.ne.z1.or.thrdscf.gt.1.1d0*thrdscf_min) then
+c... reset to no convergence
+          notkon=1
+          itend=itmax
+        end if
+      end if
+      call corlsr(ihpos)
+      call flush6
+      first=.false.
+      if(print_wallcl) then
+        w1=wallcl()
+        wall_it=w1-wlast
+        wlast=w1
+        wall_dfti_tot=wall_dfti_tot+wall_dfti
+        if(iprint(39).ge.1) write(iout,'(1x,2(a,f8.2))')
+     >       'Elapsed times:  DFTI:',wall_dfti,
+     >       ' sec,  ITERATION:',wall_it
+      end if
+c... Add spin-dependent term
+      if(iedft.ne.0) then
+        call daxpy_X(ntdg,1d0,q(iemb),1,q(igpos),1)
+      end if
+c...
+c... Iterations end here.
+c...
+c
+!       if(changed_thresholds.or.coarse_grid
+!      &   .or.nit.lt.itend.or.(iter.lt.4.and.nita.eq.1))goto 1
+      ! cgk, 2010.10.8: removed the iter.lt.4 part. Otherwise maxit,1 ignored
+      ! in open-shell case. What is this supposed to be doing?
+      if(changed_thresholds.or.coarse_grid
+     &   .or.nit.lt.itend) goto 1
+c
+c... postprocessing
+c
+       if(iedft.ne.0.and.lzmp) then
+         call fmove(q(icpos),q(izmpcpos),ntqg)
+         write(6,*) 'orbitals out'
+         do i=1, 5
+          write(6,*) q(icpos+i-1)
+         end do
+       end if
+c
+      call corlsr(iscr1)
+      if(print_wallcl) then
+        w1=wallcl()
+        wall_tot=w1-wstart
+        write(iout,'(/1x,2(a,f8.2))') 'Total elapsed times:  DFTI:',
+     >      wall_dfti_tot,' sec,  ITERATIONS:',wall_tot
+      end if
+      if(allocj) call release_jint
+      if(fitenergy) then
+        call get_inpi('LOCFIT','CFIT',locfit)
+        if(locfit.lt.0) call get_inpi('LOCFIT_SCF','CFIT',locfit)
+        if(locfit.gt.0) then
+          gesen=gesen-z05*zwen
+          t1=second()
+          call dfexch(q(idapos),q(ifpos),q(igpos),q(icpos),
+     >                .false.,.true.,zwen,0,0)
+          t2=second()
+          cpu=t2-t1
+          cpu_tot=t2-cpu_start
+          gesen=gesen+z05*zwen
+          call setvar('!DFHFENERG',gesen-ekern,' ',1,1,mxm,0)
+          call set_dumpenergy(gesen-ekern)
+          write(iout,993) gesen,zwen,cpu,cpu_tot
+993       format(' Non-local fit of energy:',t36,f19.8,f14.6,38x,2f9.1)
+          call flush6()
+        end if
+      else if(do_exchange) then
+        first=.true.
+        call fzero(q(igpos),ntdg)
+        call hfma(q(idapos),q(idbpos),q(ifpos),q(igpos),iclosed,
+     >            1,0,first,.true.,q(icpos),.false.,.false.)
+        scf_exch=-z05*spur(q(idapos),q(igpos))
+        write(iout,9941) scf_exch
+        call setvar ('E_EXCHANGE',scf_exch,' ',1,1,nv,0)
+9941    format(/' Exchange energy:',f20.12)
+      end if
+c
+      if((direct.or.IsRangeHybrid.eq.1).and.icfit.le.1) then
+CAOM ..      if(direct.and.icfit.le.1) then
+        call freek2
+        call free_GTlist
+        Call free_PPList
+        call free_Tlist
+        call clssew
+      end if
+c... dispersion correction
+      if(idispc.gt.0) then
+         write(iout,'(/,1x,a,/,1x,11(''- ''))') 'Dispersion correction'
+         call dftd3
+         gesen=gesen+endftd3
+         write(iout,'(/,1x,a,a,i1,a,t30,f15.8)')
+     >         scftyp,' STATE 1.',isyref,' ENERGY+DISP',gesen
+      endif
+c... end dispersion correction
+      if (fitexch) call free_gpt
+      if(icfit.gt.4) call dfexch_term
+      iscr1=icorr(2*ntqg+2*ntg)
+      call write_fock(q(ifpos),1,'TOTAL')
+      call get_inpl('BLOCKDIA','HFOPT',lblock)
+      call reordc(q(icpos),q(iepos),nbs1)
+      if(opensh) then
+        call write_fock(q(igpos),4,'OPEN AO')
+        call tranop_mpp(q(igpos),q(icpos),q(iscr1),1,1,1,0)
+        call write_fock(q(igpos),2,'OPEN')
+      else
+        iscr2=iscr1+ntqg
+        iscr3=icorr(ntqg)
+        if(iter.eq.1.and.istart.gt.1) then
+          call les(q(iscr1),ntdg,1,sm)
+          call expq(q(iscr1),q(iscr2))
+          call les(q(iscr1),ntdg,1,rs)
+          call expq(q(iscr1),q(iscr3))
+          call expq(q(idapos),q(iscr1))
+          call virtmo(q(ifpos),q(icpos),q(iepos),
+     >                q(iscr1),q(iscr2),q(iscr3),nbs)
+          call reordc(q(icpos),q(iepos),nbs1)
+          call orbord(q(icpos),q(iepos),nbs1)
+          call write_eig(q(iepos),1,'CANONICAL')
+          call write_orb(q(icpos),1,'CANONICAL')
+        else if(iter.gt.1) then
+          if(lblock) write(iout,'(/1x,a)')
+     >       'Block diagonalizing Fock matrix'
+c
+c... block diagonalization of Fock matrix
+c
+          call tranop_mpp(q(ifpos),q(icpos),q(iscr1),1,1,1,0)
+          call expq(q(ifpos),q(iscr2))
+          do is=1,nsk
+            ifa=iscr2+ntq(is)
+            ica=icpos+ntq(is)
+            icn=iscr1+ntq(is)
+            iea=iepos+nts(is)
+            n=nt(is)
+            m=nbs(is)
+            nc=icororb(is)
+            if(lblock.and.nc.gt.0) then
+c... core
+              call cieig(q(ifa),n,q(iscr3),nc,q(iea),nc,0)
+              call mxma(q(ica),1,n,q(iscr3),1,nc,q(icn),1,n,n,nc,nc)
+              ifa=ifa+(n+1)*nc
+              ica=ica+n*nc
+              icn=icn+n*nc
+              iea=iea+nc
+              m=m-nc
+            end if
+c... valence
+            if(m.gt.0) then
+              call cieig(q(ifa),n,q(iscr3),m,q(iea),m,0)
+              call mxma(q(ica),1,n,q(iscr3),1,m,q(icn),1,n,n,m,m)
+              ifa=ifa+(n+1)*m
+              ica=ica+n*m
+              icn=icn+n*m
+              iea=iea+m
+            end if
+c... virtual
+            nv=n-nbs(is)
+            if(nv.gt.0) then
+              call cieig(q(ifa),n,q(iscr3),nv,q(iea),nv,0)
+              call mxma_mpp(q(ica),1,n,q(iscr3),1,nv,q(icn),1,n,n,nv,nv)
+            end if
+          end do
+          call fmove(q(iscr1),q(icpos),ntqg)
+          call reordc(q(icpos),q(iepos),nbs1)
+          call orbord(q(icpos),q(iepos),nbs1)
+          call write_eig(q(iepos),1,'CANONICAL')
+          call write_orb(q(icpos),1,'CANONICAL')
+          call corlsr(iscr3)
+        end if
+        call fzero(q(ifpos),ntdg)
+        call write_fock(q(ifpos),2,'OPEN')
+      end if
+c
+      iterp=iter
+      if(notkon.ne.0) iterp=-iter
+      call setvar('ITERATIONS',dble(iterp),' ',1,1,mxm,0)
+      if(nel.le.nel1) then
+        do l=1,nsk
+          n=nbs(l)
+          nbs(l)=nbs1(l)
+          nbs1(l)=n
+        end do
+      end if
+      call blank_line(iout)
+      call fzero(scfoccs,8)
+      do i=1,nsk
+        scfoccs(i)=dble(max(nbs(i),nbs1(i)))
+      end do
+      if(nel.ne.nel1) then
+        write(iout,994) ' alpha ',(nbs(i),i=1,nsk)
+        write(iout,994) ' beta  ',(nbs1(i),i=1,nsk)
+      else
+        write(iout,994) ' ',(nbs(i),i=1,nsk)
+994     format(' Final',a,'occupancy:',8i4)
+      end if
+c...  cosmo outlying charge correction
+      itcosmo=iget_scalar('COSMOIT')
+      if(icosmo.ne.0 .and. itcosmo.le.0)
+     &    call cosmo_corr(gesen,ediel,q(idapos))
+      call read_den(q(idapos),1)
+      call ausgab(q(icpos),q(iepos),q(iscr1),q(idapos),q(idbpos),
+     >    1,scftyp,ifsav,vcpp0,scf_exch,icosmo,ediel)
+      do i=1,ntg
+        n=nb(i)/10
+        q(iepos-1+i)=dble(nb(i)-n*9)
+      end do
+      call occsv(q(iepos),3)
+      call write_grp(q(iepos),1,'RHF')
+      call write_occ(q(iepos),1,'RHF')
+      if(nohf.ne.0)  call write_occ(q(iepos),2,'NOHF')
+      if (parderiv) then
+         call semigrad
+      endif
+      if(notkon.ne.0) then
+      if(iprocs.eq.0) then
+       write(ipun,999)
+  999  format('?ERROR: NO CONVERGENCE IN RHF-SCF')
+      end if
+        write(iout,'(/1x,a/)') 'No convergence'
+      else
+        istatx(1)=1  !must be set before flush_dump!
+      end if
+      call flush_dump
+      ni=0
+      call sudat(1,1305,ni)
+      nen1=max(nen1,ni)
+      if(idft.ne.0) then
+        ni=0
+        call sudat(1,1800,ni)
+        nen1=max(nen1,ni)
+        if(icoulfil.eq.4.and.icoulrec.ne.0) then
+          ni=0
+          call sudat(4,icoulrec,ni)
+          nen4=max(nen4,ni)
+        end if
+      end if
+      if(iptyp.eq.'KAIN'.or.iptyp.eq.'DIIS')
+     >   call ReleaseDiisState(diis_state,.true.)
+      call truncate_file(1,0,nen1)
+      call truncate_file(4,0,nen4)
+c     call printrec(4)
+c... ZMP output
+      if(lzmp) then
+        call write_fock(q(izmpfpos),1,'TOTAL')
+c        call corlsr(izmpfpos)
+      end if
+c... End ZMP output
+      if(iprint(39).ge.0) then
+        call add_mpptim('TOTAL',0,1)
+        call print_mpptim(0,.true.,scftyp)
+      end if
+      call term_mpptim
+      if(fitexch.and.iprint(39).ge.0) call df_report_times
+      if(igrdc.gt.1.and.istatx(1).lt.0) call error('No convergence',
+     >    'rhfpro')
+      call scf_3ix_intcache_term()
+      call grid_orbital_term()
+      call unset_dac_diag(1)
+      if(icfit.ne.0) call clearvar('!INTCACHE')
+      if(get_logical("!EMBED")) CALL set_Embedding_Energy(0,0)
+      if(idft.ne.0) call writem(q(ixcmat),ntqg,1,7900,0,'XCMAT')
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine virtmo(f,c,e,d,s,smh,nbs)
+c-----------------------------------------------------------------------
+      implicit double precision (a-h,o-z)
+      include "common/bas"
+      include "common/zahl"
+      include "common/tapes"
+      include "common/scfopt"
+      include "common/big"
+      dimension f(*),c(*),e(*),d(*),s(*),smh(*),nbs(8)
+      ipao=icorr(ntqg)
+      iscr1=icorr(ntqg)
+      iscr2=icorr(ntqg)
+      ieig1=icorr(ntg)
+      ieig2=icorr(ntg)
+      call expq(f,q(iscr1))
+      do l=1,nsk
+        m=nbs(l)
+        n=nt(l)
+        ic=ntq(l)+1
+        call mxma(q(iscr1+ntq(l)),1,n,c(ic),1,n,q(iscr2),1,n,n,n,m)
+        call mxma(c(ic),n,1,q(iscr2),1,n,q(iscr1),1,m,m,n,m)
+        if(jacobi.gt.0) then
+         call rsjc(m,m,q(iscr1),e(nts(l)+1),q(iscr2))
+        else
+         call cieig(q(iscr1),m,q(iscr2),m,e(nts(l)+1),m,0)
+        end if
+        call mxma(c(ic),1,n,q(iscr2),1,m,q(iscr1),1,n,n,m,m)
+        call fmove(q(iscr1),c(ic),n*m)
+      end do
+      call dscal_X(ntqg,z05,d,1)
+      call mulq(d,s,q(iscr1))
+      call ad1m(q(iscr1),-z1,0)
+      call mulq(q(iscr1),smh,q(ipao))
+      call tranop_mpp(f,q(ipao),q(iscr1),1,1,1,0)
+      call eig(f,q(iscr2),q(iscr1),q(ieig2),ntqg,1)
+      call mulq(smh,q(iscr1),q(iscr2))
+      do l=1,nsk
+        iadc=ntq(l)+nbs(l)*nt(l)+1
+        iade=nts(l)+nbs(l)+1
+        ii=ieig2+nts(l)
+        iv=iscr2+ntq(l)
+        nv=0
+        do i=1,nt(l)
+          if(abs(q(ii)).gt.1.d-7) then
+            nv=nv+1
+            e(iade)=q(ii)
+            call fmove(q(iv),c(iadc),nt(l))
+            iade=iade+1
+            iadc=iadc+nt(l)
+          end if
+          iv=iv+nt(l)
+          ii=ii+1
+        end do
+        if(nv.ne.nt(l)-nbs(l)) then
+          i1=ieig2+nts(l)
+          i2=ieig2+nts(l)+max(nt(l)-nv,nbs(l))-1
+          write(6,*) 'eig: ',q(i1:i2)
+          write(6,*) 'nv=',nv,'  nt(l)-nbs(l)=',nt(l)-nbs(l)
+          call error('Linear dependent orbitals','virtmo')
+        end if
+      end do
+      call corlsr(ipao)
+      return
+      end
+c-----------------------------------------------------------------------
+      integer function icororb(is)
+c-----------------------------------------------------------------------
+      implicit double precision (a-h,o-z)
+      include "common/corb"
+      icororb=icore(is)
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine reordc(c,eps,nbs)
+c-----------------------------------------------------------------------
+      implicit double precision (a-h,o-z)
+c... order orbitals according to orbital energies.
+c... the number of orbitals to be considered per symmetry is provided in nbs
+      include "common/bas"
+      dimension c(*),eps(*),nbs(8)
+      do is=1,nsk
+        iofs=nts(is)
+        ii=ntq(is)+1
+        n=nt(is)
+        nc=nbs(is)
+        do i=1,nc-1
+          jm=i
+          em=eps(iofs+i)
+          ei=em
+          do j=i+1,nc
+            if(eps(iofs+j).lt.em) then
+              jm=j
+              em=eps(iofs+j)
+            end if
+          end do
+          if(jm.ne.i) then
+            jj=ntq(is)+(jm-1)*n+1
+            call dswap_x(n,c(ii),1,c(jj),1)
+            eps(iofs+i)=em
+            eps(iofs+jm)=ei
+          end if
+          ii=ii+n
+        end do
+      end do
+      return
+      end
+
+      ! make two ntg-sized arrays of occupation numbers for closed-shell
+      ! orbitals and open-shell orbitals, from
+      !    nocc(isy): number of occupied orbitals in isy
+      !    iclos(isy): number of closed-shell orbitals in isy
+      ! Allocates memory. Release ioccc.
+c-----------------------------------------------------------------------
+      subroutine make_rhf_occ(ioccc,iocco, iclos,nocc, ntg,nts,nsk)
+c-----------------------------------------------------------------------
+      implicit double precision (a-h,o-z)
+      include "common/big"
+      integer :: iclos(nsk), nocc(nsk), nts(nsk)
+      ioccc = icorr(ntg)
+      iocco = icorr(ntg)
+      call fzero(q(ioccc),ntg)
+      call fzero(q(iocco),ntg)
+      do isy = 1,nsk
+         do i = 0, nocc(isy)-1
+            q(iocco+nts(isy)+i) = 1.0d0
+            q(ioccc+nts(isy)+i) = 1.0d0
+         end do
+         do i = 0, iclos(isy)-1
+            q(iocco+nts(isy)+i) = 0.0d0
+            q(ioccc+nts(isy)+i) = 2.0d0
+         end do
+      end do
+!         print "(1x,A,999F12.5)", "ioccc(i):", (q(ioccc+i), i=0,ntg-1)
+!         print "(1x,A,999F12.5)", "iocco(i):", (q(iocco+i), i=0,ntg-1)
+      end subroutine
