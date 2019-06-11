@@ -39,6 +39,9 @@ in order to set up the initial embedding matrix. The variable
 test-ao.py controls the PFET calculation. The submission script is job.s
 
 ###TODO###
-Right now, one still needs to get into Molpro's code in order to run PFET.
+Right now, one still needs to hack Molpro's code (cube.F) in order to run 
+PFET. (First print out the AO basis then modify cube.F and remake the exe
+for the following PFET calculations.)
 It would be great to set up some flags to let the cube.F know what to do.
-Same thing needs to be done for python scripts. 
+Similar thing needs to be done for python scripts so that you don't need to 
+modify the code each time. 
